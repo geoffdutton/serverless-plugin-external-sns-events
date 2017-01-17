@@ -1,7 +1,11 @@
 'use strict';
 var _ = require('underscore'),
     Class = require('class.extend'),
-    DELIVERY_POLICY_ATTR = 'DeliveryPolicy';
+    DELIVERY_POLICY_ATTR = 'DeliveryPolicy',
+    INVOKE_URL_TEMPLATE = 'https://%s.execute-api.%s.amazonaws.com/%s/%s',
+    util = require('util'),
+    DEFAULT_REGION = 'us-east-1',
+    BpPromise = require('bluebird');
 
 module.exports = Class.extend({
 
@@ -11,6 +15,7 @@ module.exports = Class.extend({
       this.provider = serverless ? serverless.getProvider('aws') : null;
 
       this.hooks = {
+         'info:info': this._loopEvents.bind(this, this.getInfo),
          'deploy:compileEvents': this._loopEvents.bind(this, this.addEventPermission),
          'deploy:deploy': this._loopEvents.bind(this, this.subscribeFunction),
          'before:remove:remove': this._loopEvents.bind(this, this.unsubscribeFunction),
@@ -71,7 +76,8 @@ module.exports = Class.extend({
 
    subscribeFunction: function(fnName, fnDef, topicName) {
       var self = this,
-          subscriptionAttrs;
+          subscriptionAttrs, endpoint, params,
+          protocol = 'lambda';
 
       if (_.isObject(topicName)) {
          if (_.has(topicName, DELIVERY_POLICY_ATTR)) {
@@ -79,6 +85,10 @@ module.exports = Class.extend({
                name: DELIVERY_POLICY_ATTR,
                value: topicName[DELIVERY_POLICY_ATTR]
             };
+         }
+
+         if (topicName.Protocol) {
+            protocol = topicName.Protocol;
          }
 
          topicName = topicName.topic;
@@ -93,9 +103,13 @@ module.exports = Class.extend({
 
       this._serverless.cli.log('Need to subscribe ' + fnDef.name + ' to ' + topicName);
 
-      return this._getSubscriptionInfo(fnDef, topicName)
+      return self._getFunctionEndpoint(fnDef)
+          .then(function(fnEndpoint) {
+             endpoint = fnEndpoint;
+             return self._getSubscriptionInfo(fnDef, topicName, protocol, fnEndpoint || null);
+          })
          .then(function(info) {
-            var params;
+            endpoint = endpoint || info.FunctionArn;
 
             if (info.SubscriptionArn) {
                self._serverless.cli.log('Function ' + info.FunctionArn + ' is already subscribed to ' + info.TopicArn);
@@ -105,15 +119,26 @@ module.exports = Class.extend({
                }
                return;
             }
+
             params = {
                TopicArn: info.TopicArn,
-               Protocol: 'lambda',
-               Endpoint: info.FunctionArn
+               Protocol: protocol,
+               Endpoint: endpoint
             };
             return self.provider.request('SNS', 'subscribe', params, self._opts.stage, self._opts.region)
                .then(function(response) {
                   self._serverless.cli.log('Function ' + info.FunctionArn + ' is now subscribed to ' + info.TopicArn);
                   if (subscriptionAttrs && response.SubscriptionArn) {
+                     if (response.SubscriptionArn.toLowerCase().indexOf('pending confirmation') !== -1) {
+                        self._serverless.cli.log('Subscription is pending, resubscribing, retrying in 10 seconds');
+                        return BpPromise.delay(10000).then(function() {
+                           return self._getSubscriptionInfo.bind(self)(fnDef, topicName, protocol);
+                        })
+                            .then(function(newInfo) {
+                               self._serverless.cli.log('Setting subscription attributes on: ' + newInfo.SubscriptionArn);
+                               return self._setSubscriptionAttributes(newInfo.SubscriptionArn, subscriptionAttrs);
+                            });
+                     }
                      self._serverless.cli.log('Setting subscription attributes');
                      return self._setSubscriptionAttributes(response.SubscriptionArn, subscriptionAttrs);
                   }
@@ -150,15 +175,13 @@ module.exports = Class.extend({
          });
    },
 
-   _getSubscriptionInfo: function(fnDef, topicName) {
+   _getSubscriptionInfo: function(fnDef, topicName, protocol, httpEndpoint) {
       var self = this,
-          fnArn, acctID, region, topicArn, params;
-
-      params = { FunctionName: fnDef.name };
+          params = { FunctionName: fnDef.name },
+          fnArn, acctID, region, topicArn;
 
       return this.provider.request('Lambda', 'getFunction', params, this._opts.stage, this._opts.region)
          .then(function(fn) {
-
             fnArn = fn.Configuration.FunctionArn;
             // NOTE: assumes that the topic is in the same account and region at this point
             region = fnArn.split(':')[3];
@@ -175,16 +198,54 @@ module.exports = Class.extend({
 
          })
          .then(function(resp) {
-            var existing = _.findWhere(resp.Subscriptions, { Protocol: 'lambda', Endpoint: fnArn }) || {};
+            var existing;
+
+            existing = _.find(resp.Subscriptions, function(sub) {
+               if (sub.SubscriptionArn.toLowerCase().indexOf('pending') !== -1) {
+                  return false;
+               }
+               return sub.Protocol === protocol || 'lambda' &&
+                   (sub.Endpoint === httpEndpoint || sub.Endpoint === fnArn);
+            }) || {};
 
             return {
                FunctionArn: fnArn,
                TopicArn: topicArn,
                SubscriptionArn: existing.SubscriptionArn,
+               Endpoint: existing.Endpoint,
             };
          });
+   },
 
+   _getRestApiId: function() {
+      var self = this,
+          apiName = self.provider.naming.getApiGatewayName();
 
+      return this.provider.request('APIGateway', 'getRestApis', {}, this._opts.stage, this._opts.region)
+          .then(function(res) {
+             return _.find(res.items, function(item) {
+                return apiName === item.name;
+             });
+          })
+          .then(function(api) {
+             return api ? api.id : null;
+          });
+   },
+
+   _getFunctionEndpoint: function(fnDef) {
+      var self = this,
+          httpEv, apiPath;
+
+      httpEv = _.find(fnDef.events, function(ev) {
+         return ev.hasOwnProperty('http');
+      });
+      apiPath = httpEv ? httpEv.http.path : null;
+      return this._getRestApiId().then(function(id) {
+         if (id && apiPath) {
+            return util.format(INVOKE_URL_TEMPLATE, id, self._opts.region || DEFAULT_REGION, self._opts.stage, apiPath);
+         }
+         return null;
+      });
    },
 
    _normalize: function(s) {
@@ -203,6 +264,9 @@ module.exports = Class.extend({
       var self = this,
           value, params;
 
+      if (!subscriptionArn) {
+         return BpPromise.resolve('Subscription ARN was empty');
+      }
       value = {
          healthyRetryPolicy: attribute.value
       };
